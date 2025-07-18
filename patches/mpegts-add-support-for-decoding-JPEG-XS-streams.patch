@@ -1,0 +1,219 @@
+From 877f962396ab0df424658302e095ed7885450899 Mon Sep 17 00:00:00 2001
+From: jess <jess@mediaexcel.com>
+Date: Mon, 16 Jun 2025 10:54:30 +0900
+Subject: [PATCH 1/2] mpegts: add support for decoding JPEG XS streams in TS
+
+---
+ libavformat/mpegts.c | 161 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 161 insertions(+)
+
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index 86b7c8e041..93341ce6b3 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -45,6 +45,7 @@
+ #if CONFIG_ICONV
+ #include <iconv.h>
+ #endif
++#include <string.h>
+ 
+ /* maximum size in which we look for synchronization if
+  * synchronization is lost */
+@@ -797,6 +798,25 @@ typedef struct StreamType {
+     enum AVCodecID codec_id;
+ } StreamType;
+ 
++typedef struct _MpegtsJpegXsDescriptor {
++    uint8_t descriptor_version;
++    uint16_t horizontal_size, vertical_size;
++    uint32_t brat, frat;
++    uint16_t schar, Ppih, Plev;
++    uint32_t max_buffer_size;
++    uint8_t buffer_model_type;
++    uint8_t colour_primaries;
++    uint8_t transfer_characteristics;
++    uint8_t matrix_coefficients;
++    uint8_t video_full_range_flag;
++    uint8_t still_mode;
++    uint8_t mdm_flag;
++    uint16_t X_c0, Y_c0, X_c1, Y_c1, X_c2, Y_c2;
++    uint16_t X_wp, Y_wp;
++    uint32_t L_max, L_min;
++    uint16_t MaxCLL, MaxFALL;
++} MpegtsJpegXsDescriptor;
++
+ static const StreamType ISO_types[] = {
+     { 0x01, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_MPEG2VIDEO },
+     { 0x02, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_MPEG2VIDEO },
+@@ -814,6 +834,7 @@ static const StreamType ISO_types[] = {
+     { 0x20, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264       },
+     { 0x21, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_JPEG2000   },
+     { 0x24, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_HEVC       },
++    { 0x32, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_JPEGXS     },
+     { 0x33, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_VVC        },
+     { 0x42, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_CAVS       },
+     { 0xd1, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_DIRAC      },
+@@ -895,6 +916,68 @@ static const StreamType DESC_types[] = {
+     { 0 },
+ };
+ 
++static int parse_jpegxs_descriptor(MpegtsJpegXsDescriptor *jpegxs, const uint8_t **pp, const uint8_t *p_end) 
++{
++    int flags = 0;
++    memset(jpegxs, 0, sizeof(*jpegxs));
++
++    if (p_end - *pp < 29)
++    {
++        return AVERROR_INVALIDDATA;
++    }
++
++    jpegxs->descriptor_version = get8(pp, p_end);
++
++    if (jpegxs->descriptor_version != 0)
++    {
++        av_log(NULL, AV_LOG_WARNING, "Unsupported JPEG-XS descriptor version (%d != 0)", jpegxs->descriptor_version);
++        return AVERROR_INVALIDDATA;
++    }
++
++    jpegxs->horizontal_size = get16(pp, p_end);
++    jpegxs->vertical_size = get16(pp, p_end);
++    jpegxs->brat = bytestream_get_be32(pp);
++    jpegxs->frat = bytestream_get_be32(pp);
++    jpegxs->schar = get16(pp, p_end);
++    jpegxs->Ppih = get16(pp, p_end);
++    jpegxs->Plev = get16(pp, p_end);
++    jpegxs->max_buffer_size = bytestream_get_be32(pp);
++    jpegxs->buffer_model_type = get8(pp, p_end);
++    jpegxs->colour_primaries = get8(pp, p_end);
++    jpegxs->transfer_characteristics = get8(pp, p_end);
++    jpegxs->matrix_coefficients = get8(pp, p_end);
++    jpegxs->video_full_range_flag = (get8(pp, p_end) & 0x80) == 0x80 ? 1 : 0;
++
++    flags = get8(pp, p_end);
++
++    jpegxs->still_mode = flags >> 7;
++
++    if ((flags & 0x40) == 0x40)
++    {
++        if (p_end - *pp < 28)
++        {
++            av_log(NULL, AV_LOG_WARNING, "MDM present on JPEG-XS descriptor but not enough bytes");
++            return AVERROR_INVALIDDATA;
++        }
++
++        jpegxs->X_c0 = get16(pp, p_end);
++        jpegxs->Y_c0 = get16(pp, p_end);
++        jpegxs->X_c1 = get16(pp, p_end);
++        jpegxs->Y_c1 = get16(pp, p_end);
++        jpegxs->X_c2 = get16(pp, p_end);
++        jpegxs->Y_c2 = get16(pp, p_end);
++        jpegxs->X_wp = get16(pp, p_end);
++        jpegxs->Y_wp = get16(pp, p_end);
++        jpegxs->L_max = bytestream_get_be32(pp);
++        jpegxs->L_min = bytestream_get_be32(pp);
++        jpegxs->MaxCLL = get16(pp, p_end);
++        jpegxs->MaxFALL = get16(pp, p_end);
++        jpegxs->mdm_flag = 1;
++    }
++
++    return 0;
++}
++
+ static void mpegts_find_stream_type(AVStream *st,
+                                     uint32_t stream_type,
+                                     const StreamType *types)
+@@ -1024,6 +1107,16 @@ static int new_pes_packet(PESContext *pes, AVPacket *pkt)
+         av_log(pes->stream, AV_LOG_WARNING, "PES packet size mismatch\n");
+         pes->flags |= AV_PKT_FLAG_CORRUPT;
+     }
++    
++    // JPEG-XS PES payload
++    if (pes->stream_id == 0xbd && pes->stream_type == 0x32 &&
++        pkt->size >= 8 && memcmp(pkt->data + 4, "jxes", 4) == 0)
++    {
++        uint32_t header_size = AV_RB32(pkt->data);
++        pkt->data += header_size;
++        pkt->size -= header_size;
++    }
++
+     memset(pkt->data + pkt->size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+ 
+     // Separate out the AC3 substream from an HDMV combined TrueHD/AC3 PID
+@@ -2244,6 +2337,74 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
+                    dovi->dv_md_compression);
+         }
+         break;
++    case 0x3f: /* desciptor extension */
++        {
++            int ext_tag, interlace_mode, n_fields;
++            ext_tag = get8(pp, desc_end);
++
++            /* JPEG-XS video descriptor*/
++            if (ext_tag == 0x14) { 
++                MpegtsJpegXsDescriptor jpegxs;
++                if (parse_jpegxs_descriptor(&jpegxs, pp, desc_end) < 0) 
++                    return AVERROR_INVALIDDATA;
++
++                interlace_mode = (jpegxs.frat >> 30) & 0x3;
++
++                if (interlace_mode == 3) {
++                    av_log(fc, AV_LOG_WARNING, "Unknown JPEG XS interlace mode 3");
++                    return AVERROR_INVALIDDATA;
++                }
++
++                st->codecpar->field_order = interlace_mode == 0 ? AV_FIELD_PROGRESSIVE : (interlace_mode == 1 ? AV_FIELD_TT : AV_FIELD_BB);
++
++                n_fields = st->codecpar->field_order == AV_FIELD_PROGRESSIVE ? 1 : 2;
++
++                if ((jpegxs.schar >> 15) == 0) {
++                    av_log(fc, AV_LOG_WARNING, "JPEG-XS sampling properties are required\n");
++                    // return AVERROR_INVALIDDATA;
++                }
++
++                // int depth = ((jpegxs.schar >> 4) & 0xf) + 1;
++
++                st->codecpar->width = jpegxs.horizontal_size;
++                st->codecpar->height = jpegxs.vertical_size * n_fields;
++
++                if (jpegxs.frat != 0) {
++                    int framerate_num = (jpegxs.frat & 0x0000FFFFU);
++                    int framerate_den = ((jpegxs.frat >> 24) & 0x0000003FU);
++
++                    if (framerate_den == 1) {
++                    }
++                    else if (framerate_den == 2) {
++                        framerate_num *= 1000;
++                        framerate_den = 1001;
++                    }
++                    else {
++                        av_log(fc, AV_LOG_WARNING, "Unknown JPEG XS framerate denominator code %u", framerate_den);
++                        return AVERROR_INVALIDDATA;
++                    }
++
++                    st->codecpar->framerate.num = framerate_num;
++                    st->codecpar->framerate.den = framerate_den;
++                }
++
++                switch (jpegxs.schar & 0xf) {
++                case 0: st->codecpar->format = AV_PIX_FMT_YUV422P10LE; break;
++                case 1: st->codecpar->format = AV_PIX_FMT_YUV444P10LE; break;
++                default:
++                    av_log(fc, AV_LOG_WARNING, "Unknown JPEG XS sampling format");
++                    break;
++                }
++
++                st->codecpar->color_range = jpegxs.video_full_range_flag ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++                st->codecpar->color_primaries = jpegxs.colour_primaries;
++                st->codecpar->color_trc = jpegxs.transfer_characteristics;
++                st->codecpar->color_space = jpegxs.matrix_coefficients;
++
++                ffstream(st)->need_parsing = AVSTREAM_PARSE_NONE;
++            }
++        }
++        break;
+     default:
+         break;
+     }
+-- 
+2.34.1
+
