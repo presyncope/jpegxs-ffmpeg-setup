@@ -23,19 +23,20 @@ check_ubuntu_env() {
         log_warning "/etc/os-release 파일을 찾을 수 없습니다. Ubuntu 환경 확인 불가."
     fi
 }
+
 main() {
     check_ubuntu_env
 
-    export LD_LIBRARY_PATH="$PWD/install-dir/lib:${LD_LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="$PWD/../install-dir/lib:${LD_LIBRARY_PATH:-}"
     log_info "LD_LIBRARY_PATH set to: $LD_LIBRARY_PATH"
 
-    local FFMPEG_BIN="$PWD/install-dir/bin/ffmpeg"
-    if [ ! -x "$FFMPEG_BIN" ]; then
-        log_error "FFmpeg 실행 파일을 찾을 수 없습니다: $FFMPEG_BIN"
+    local JXS_BIN="$PWD/../install-dir/bin/SvtJpegxsDecApp"
+    if [ ! -x "$JXS_BIN" ]; then
+        log_error "SvtJpegxsDecApp 실행 파일을 찾을 수 없습니다: $JXS_BIN"
     fi
 
-    log_info "Executing: $FFMPEG_BIN $*"
-    exec "$FFMPEG_BIN" "$@"
+    log_info "Executing: $JXS_BIN $*"
+    exec "$JXS_BIN" "$@"
 }
 
 main "$@"
